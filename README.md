@@ -71,8 +71,6 @@ IMMUNOPEPTIDOMICS/
 │   ├── 3a_mhcflurry2_analysis_with_flank.sh
 │   ├── 3b_select_top_alleles_MHCflurry.R
 │   └── 4_gen_bedfiles.R
-├── analysis/
-│   └── venn_exact_matches.R
 ├── data/
 ├── results/
 ├── logs/
@@ -95,7 +93,7 @@ Generated results, logs, checkpoints, reference FASTA files and local configurat
 ### Prediction software
 
 - NetMHCpan 4.2
-- MHCflurry
+- MHCflurry 2.0
 
 NetMHCpan must be downloaded and licensed separately according to its distribution terms.
 
