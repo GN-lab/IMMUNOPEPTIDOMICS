@@ -1,7 +1,11 @@
 #!/usr/bin/env Rscript
 
-# JUGNU immunopeptidome - Step 4
+# ============================================================
+# July 2026 | Gaurav Raichand | The Institute of Cancer Research
+#
+# JUGNU immunopeptidome - Step 4 
 # Cross-tool concordance tiering followed by Tier-1 BED generation.
+# ============================================================
 
 suppressPackageStartupMessages(library(data.table))
 
