@@ -5,6 +5,9 @@ A SLURM-based pipeline for generating a canonical human immunopeptidome by integ
 
 The pipeline tiles protein-coding Ensembl transcripts into peptides, predicts HLA class I presentation, performs cross-tool concordance analysis, and produces transcript-coordinate BED files of high-confidence candidates.
 
+<img width="1693" height="929" alt="Immunopeptidomic" src="https://github.com/user-attachments/assets/485d0e96-a7e5-41c3-8cde-87884abd78fe" />
+
+
 ## Pipeline overview
 
 1. **Peptide generation**
