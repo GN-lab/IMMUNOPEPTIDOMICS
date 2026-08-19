@@ -33,7 +33,7 @@ export FASTA_CANONICAL="${WORKDIR}/data/UP000005640_9606.fasta"
 #   bash scripts/setup_alleles.sh
 
 
-export HLA_ALLELE_FILE="${WORKDIR}/data/iedb_27_alleles.txt"
+export HLA_ALLELE_FILE="${WORKDIR}/data/iedb_70_alleles.txt"
 
 # --- Tools --------------------------------------------------
 export NETMHCPAN_BIN="/data/rds/DMP/UCEC/EVOLIMMU/graichand/netMHCpan-4.2/netMHCpan"
