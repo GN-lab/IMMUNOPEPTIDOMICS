@@ -169,9 +169,6 @@ HLA-C07:01
 
 Alternatively, generate an HLA-A, HLA-B and HLA-C list from the local NetMHCpan installation:
 
-```bash
-bash setup_alleles.sh
-```
 
 ## Running the pipeline
 
