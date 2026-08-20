@@ -1,9 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=IMMUNOPEP_JUGNU
-#SBATCH --partition=compute
-#SBATCH --cpus-per-task=24
-#SBATCH --mem-per-cpu=8042
-#SBATCH --time=5-00:00:00
+#SBATCH --partition=master-worker
+#SBATCH --mem-per-cpu=4021
+#SBATCH --time=40:00:00
 #SBATCH --output=logs/master_%j.log
 
 set -euo pipefail
@@ -14,7 +13,8 @@ trap 'rc=$?; echo "**ERROR** rc=$rc line $LINENO: $BASH_COMMAND" >&2; exit $rc' 
 # JUGNU_IMMUNOPEPTIDOME — master.sh
 # July 2026 | Gaurav Raichand | The Institute of Cancer Research
 #
-# Usage: sbatch master.sh          (from WORKDIR)
+# Usage: sbatch master.sh          (from WORKDIR; lightweight orchestrator)
+#        bash master.sh            (submit immediately from a login shell)
 #        bash master.sh --dry-run  (print jobs without submitting)
 #
 # Pipeline steps:
@@ -29,7 +29,9 @@ trap 'rc=$?; echo "**ERROR** rc=$rc line $LINENO: $BASH_COMMAND" >&2; exit $rc' 
 #   - Is submitted as a durable SLURM job (not --wrap) so restarts are safe
 #   - Validates its key output before touching the checkpoint
 #   - Is skipped automatically if checkpoint already exists (safe re-run)
-#   - Depends on the previous step via SLURM --dependency=afterok
+#   - Uses two parallel branches after Step 1:
+#       Step 2a -> Step 2b and Step 3a -> Step 3b
+#   - Runs Step 4 only after both branch endpoints finish successfully
 # ============================================================
 
 # WORKDIR must be hardcoded -- BASH_SOURCE[0] resolves to the SLURM spool
@@ -160,7 +162,12 @@ touch \"${WORKDIR}/.checkpoints/${name}.done\""
   echo "$jobid"
 }
 
-jobPrev=""
+jobStep1=""
+jobStep2a=""
+jobStep2b=""
+jobStep3a=""
+jobStep3b=""
+jobStep4=""
 
 echo "=== JUGNU_IMMUNOPEPTIDOME Pipeline Submission ==="
 echo "    WORKDIR:  ${WORKDIR}"
@@ -183,18 +190,18 @@ touch \"${WORKDIR}/.checkpoints/step1_gen_nmers.done\""
   SCRIPT_1=$(write_job_script "step1_gen_nmers" "$BODY_1")
   echo "[INFO] Submitting Step 1: Gen_nmers.R (16 CPUs, ~128G, 4h)..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY-RUN] step1_gen_nmers"; jobPrev="dry_run_1"
+    echo "[DRY-RUN] step1_gen_nmers (dep=none)"
+    jobStep1="dry_run_step1"
   else
-    jobPrev=$(sbatch --parsable \
+    jobStep1=$(sbatch --parsable \
       --job-name="step1_gen_nmers" \
       --partition=compute \
       --cpus-per-task=16 \
       --mem-per-cpu=8042 \
       --time=4:00:00 \
       --output="logs/step1_gen_nmers_%j.log" \
-      ${jobPrev:+--dependency=afterok:${jobPrev}} \
       "$SCRIPT_1")
-    echo "  Submitted step1_gen_nmers -> jobid ${jobPrev}"
+    echo "  Submitted step1_gen_nmers -> jobid ${jobStep1}"
   fi
 else
   echo "  step1_gen_nmers: already done (checkpoint exists)"
@@ -214,18 +221,19 @@ touch \"${WORKDIR}/.checkpoints/step2a_netmhcpan.done\""
   SCRIPT_2A=$(write_job_script "step2a_netmhcpan" "$BODY_2A")
   echo "[INFO] Submitting Step 2a: NetMHCpan (24 CPUs, ~192G, 5 days)..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY-RUN] step2a_netmhcpan"; jobPrev="dry_run_2a"
+    echo "[DRY-RUN] step2a_netmhcpan (dep=${jobStep1:-none})"
+    jobStep2a="dry_run_step2a"
   else
-    jobPrev=$(sbatch --parsable \
+    jobStep2a=$(sbatch --parsable \
       --job-name="step2a_netmhcpan" \
       --partition=compute \
       --cpus-per-task=24 \
       --mem-per-cpu=8042 \
       --time=5-00:00:00 \
       --output="logs/step2a_netmhcpan_%j.log" \
-      ${jobPrev:+--dependency=afterok:${jobPrev}} \
+      ${jobStep1:+--dependency=afterok:${jobStep1}} \
       "$SCRIPT_2A")
-    echo "  Submitted step2a_netmhcpan -> jobid ${jobPrev}"
+    echo "  Submitted step2a_netmhcpan -> jobid ${jobStep2a}"
   fi
 else
   echo "  step2a_netmhcpan: already done"
@@ -245,18 +253,19 @@ bash \"${SCRIPT_PATH}\" __validate_step__ step2b_select_netmhc \"${OUTPUT_DIR}\"
 touch \"${WORKDIR}/.checkpoints/step2b_select_netmhc.done\""
   SCRIPT_2B=$(write_job_script "step2b_select_netmhc" "$BODY_2B")
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY-RUN] step2b_select_netmhc"; jobPrev="dry_run_2b"
+    echo "[DRY-RUN] step2b_select_netmhc (dep=${jobStep2a:-none})"
+    jobStep2b="dry_run_step2b"
   else
-    jobPrev=$(sbatch --parsable \
+    jobStep2b=$(sbatch --parsable \
       --job-name="step2b_select_netmhc" \
       --partition=compute \
       --cpus-per-task=8 \
       --mem-per-cpu=8042 \
       --time=2:00:00 \
       --output="logs/step2b_select_netmhc_%j.log" \
-      ${jobPrev:+--dependency=afterok:${jobPrev}} \
+      ${jobStep2a:+--dependency=afterok:${jobStep2a}} \
       "$SCRIPT_2B")
-    echo "  Submitted step2b_select_netmhc -> jobid ${jobPrev}"
+    echo "  Submitted step2b_select_netmhc -> jobid ${jobStep2b}"
   fi
 else
   echo "  step2b_select_netmhc: already done"
@@ -265,7 +274,7 @@ fi
 # -----------------------------------------------------------------------
 # Step 3a: MHCflurry predictions (GPU)
 #   Resources: gpu, 4 CPUs, 13600MB/cpu, 1 GPU, 7 days
-#   Input:  canonical_0Xmer_mhcflurry_input_*.csv (written by 2b prep step)
+#   Input:  canonical_0Xmers_*.tsv (written by Step 1)
 #   Output: canonical_0Xmers_flank_mhcflurry_*.csv (x4)
 # -----------------------------------------------------------------------
 if ! step_done "step3a_mhcflurry"; then
@@ -276,9 +285,10 @@ touch \"${WORKDIR}/.checkpoints/step3a_mhcflurry.done\""
   SCRIPT_3A=$(write_job_script "step3a_mhcflurry" "$BODY_3A")
   echo "[INFO] Submitting Step 3a: MHCflurry GPU (4 CPUs, 1 GPU, 7 days)..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY-RUN] step3a_mhcflurry"; jobPrev="dry_run_3a"
+    echo "[DRY-RUN] step3a_mhcflurry (dep=${jobStep1:-none})"
+    jobStep3a="dry_run_step3a"
   else
-    jobPrev=$(sbatch --parsable \
+    jobStep3a=$(sbatch --parsable \
       --job-name="step3a_mhcflurry" \
       --partition=gpu \
       --cpus-per-task=4 \
@@ -286,9 +296,9 @@ touch \"${WORKDIR}/.checkpoints/step3a_mhcflurry.done\""
       --gpus-per-node=1 \
       --time=7-00:00:00 \
       --output="logs/step3a_mhcflurry_%j.log" \
-      ${jobPrev:+--dependency=afterok:${jobPrev}} \
+      ${jobStep1:+--dependency=afterok:${jobStep1}} \
       "$SCRIPT_3A")
-    echo "  Submitted step3a_mhcflurry -> jobid ${jobPrev}"
+    echo "  Submitted step3a_mhcflurry -> jobid ${jobStep3a}"
   fi
 else
   echo "  step3a_mhcflurry: already done"
@@ -309,18 +319,19 @@ touch \"${WORKDIR}/.checkpoints/step3b_select_mhcflurry.done\""
   SCRIPT_3B=$(write_job_script "step3b_select_mhcflurry" "$BODY_3B")
   echo "[INFO] Submitting Step 3b: Select top MHCflurry alleles (8 CPUs, ~64G, 2h)..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY-RUN] step3b_select_mhcflurry"; jobPrev="dry_run_3b"
+    echo "[DRY-RUN] step3b_select_mhcflurry (dep=${jobStep3a:-none})"
+    jobStep3b="dry_run_step3b"
   else
-    jobPrev=$(sbatch --parsable \
+    jobStep3b=$(sbatch --parsable \
       --job-name="step3b_select_mhcflurry" \
       --partition=compute \
       --cpus-per-task=8 \
       --mem-per-cpu=8042 \
       --time=2:00:00 \
       --output="logs/step3b_select_mhcflurry_%j.log" \
-      ${jobPrev:+--dependency=afterok:${jobPrev}} \
+      ${jobStep3a:+--dependency=afterok:${jobStep3a}} \
       "$SCRIPT_3B")
-    echo "  Submitted step3b_select_mhcflurry -> jobid ${jobPrev}"
+    echo "  Submitted step3b_select_mhcflurry -> jobid ${jobStep3b}"
   fi
 else
   echo "  step3b_select_mhcflurry: already done"
@@ -333,6 +344,15 @@ fi
 #   Output: canonical_immunopeptidome_SB_YYYYMMDD.bed  +  .tsv
 # -----------------------------------------------------------------------
 if ! step_done "step4_gen_bedfiles"; then
+  # Step 4 is the join point: wait for both incomplete branches. If either
+  # endpoint was skipped because its checkpoint exists, no dependency is
+  # needed for that already-completed branch.
+  step4Deps=""
+  [[ -n "${jobStep2b}" ]] && step4Deps="${jobStep2b}"
+  if [[ -n "${jobStep3b}" ]]; then
+    step4Deps="${step4Deps:+${step4Deps}:}${jobStep3b}"
+  fi
+
   BODY_4="source \"${WORKDIR}/config.sh\"
 Rscript \"${SCRIPTS_DIR}/4_gen_bedfiles.R\"
 bash \"${SCRIPT_PATH}\" __validate_step__ step4_gen_bedfiles \"${OUTPUT_DIR}\" 'canonical_immunopeptidome_SB_[0-9]{8}\\.tsv' 2
@@ -340,18 +360,19 @@ touch \"${WORKDIR}/.checkpoints/step4_gen_bedfiles.done\""
   SCRIPT_4=$(write_job_script "step4_gen_bedfiles" "$BODY_4")
   echo "[INFO] Submitting Step 4: Bed files + matrix + figures (8 CPUs, ~64G, 2h)..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[DRY-RUN] step4_gen_bedfiles"; jobPrev="dry_run_4"
+    echo "[DRY-RUN] step4_gen_bedfiles (dep=${step4Deps:-none})"
+    jobStep4="dry_run_step4"
   else
-    jobPrev=$(sbatch --parsable \
+    jobStep4=$(sbatch --parsable \
       --job-name="step4_gen_bedfiles" \
       --partition=compute \
       --cpus-per-task=8 \
       --mem-per-cpu=8042 \
       --time=2:00:00 \
       --output="logs/step4_gen_bedfiles_%j.log" \
-      ${jobPrev:+--dependency=afterok:${jobPrev}} \
+      ${step4Deps:+--dependency=afterok:${step4Deps}} \
       "$SCRIPT_4")
-    echo "  Submitted step4_gen_bedfiles -> jobid ${jobPrev}"
+    echo "  Submitted step4_gen_bedfiles -> jobid ${jobStep4}"
   fi
 else
   echo "  step4_gen_bedfiles: already done"
@@ -359,7 +380,9 @@ fi
 
 echo ""
 echo "=== Submission complete ==="
-echo "    Chain: step1 -> step2a -> step2b -> step3a -> step3b -> step4"
+echo "    NetMHCpan branch: step1 -> step2a -> step2b"
+echo "    MHCflurry branch: step1 -> step3a -> step3b"
+echo "    Join: Step 4 runs after both Step 2b and Step 3b"
 echo "    Monitor:  squeue -u \$(whoami)"
 echo "    Re-run:   delete .checkpoints/STEPNAME.done, then sbatch master.sh"
 echo "    Dry-run:  bash master.sh --dry-run"
