@@ -36,7 +36,10 @@ source "${WORKDIR}/config.sh"
 : "${NETMHCPAN_BIN:?NETMHCPAN_BIN not set}"
 : "${CHUNK_SIZE:?CHUNK_SIZE not set}"
 
-RUN_DATE=$(date +%Y_%m%d)
+# An explicit date can still be supplied, but each peptide length also checks
+# for a verified completed raw file whose TSV is missing and resumes that parse
+# automatically. This prevents a next-day retry from starting predictions again.
+RUN_DATE=${NETMHCPAN_RUN_DATE:-$(date +%Y_%m%d)}
 echo "[CONFIG] OUTPUT_DIR:      ${OUTPUT_DIR}"
 echo "[CONFIG] HLA_ALLELE_FILE: ${HLA_ALLELE_FILE}"
 echo "[CONFIG] CHUNK_SIZE:      ${CHUNK_SIZE}"
@@ -90,23 +93,61 @@ run_netmhcpan_canonical() {
     return
   fi
 
-  local OUT_RAW="${OUTPUT_DIR}/canonical_${LENPAD}mer_netmhcpan_${RUN_DATE}.txt"
-  local OUT_TSV="${OUTPUT_DIR}/canonical_${LENPAD}mer_netmhcpan_${RUN_DATE}.tsv"
+  local EFFECTIVE_RUN_DATE="${RUN_DATE}"
+
+  # If no date was explicitly requested, resume the newest verified raw file
+  # that completed prediction but does not yet have its parsed TSV.
+  if [[ -z "${NETMHCPAN_RUN_DATE:-}" ]]; then
+    local RESUME_MARKER=""
+    local CANDIDATE_MARKER CANDIDATE_RAW CANDIDATE_TSV
+    while IFS= read -r CANDIDATE_MARKER; do
+      [[ -z "${CANDIDATE_MARKER}" ]] && continue
+      CANDIDATE_RAW="${CANDIDATE_MARKER%.complete}"
+      CANDIDATE_TSV="${CANDIDATE_RAW%.txt}.tsv"
+      if [[ -s "${CANDIDATE_RAW}" ]] && [[ ! -s "${CANDIDATE_TSV}" ]]; then
+        RESUME_MARKER="${CANDIDATE_MARKER}"
+      fi
+    done < <(
+      find "${OUTPUT_DIR}" -maxdepth 1 -type f \
+        -name "canonical_${LENPAD}mer_netmhcpan_*.txt.complete" | sort
+    )
+
+    if [[ -n "${RESUME_MARKER}" ]]; then
+      local RESUME_BASENAME
+      RESUME_BASENAME=$(basename "${RESUME_MARKER%.complete}")
+      EFFECTIVE_RUN_DATE=${RESUME_BASENAME#canonical_${LENPAD}mer_netmhcpan_}
+      EFFECTIVE_RUN_DATE=${EFFECTIVE_RUN_DATE%.txt}
+      echo "[INFO] Auto-resuming verified raw prediction date: ${EFFECTIVE_RUN_DATE}"
+    fi
+  fi
+
+  local OUT_RAW="${OUTPUT_DIR}/canonical_${LENPAD}mer_netmhcpan_${EFFECTIVE_RUN_DATE}.txt"
+  local OUT_TSV="${OUTPUT_DIR}/canonical_${LENPAD}mer_netmhcpan_${EFFECTIVE_RUN_DATE}.tsv"
+  local RAW_COMPLETE="${OUT_RAW}.complete"
 
   local N_PEPS
   N_PEPS=$(wc -l < "${INPUT_PEP}")
   echo ""
   echo "[INFO] === ${LENPAD}mer | ${N_PEPS} unique peptides | $(basename ${INPUT_PEP}) ==="
 
-  if [[ -f "${OUT_RAW}" ]] && [[ -s "${OUT_RAW}" ]]; then
-    echo "[INFO] Raw .txt already exists -- skipping NetMHCpan, re-parsing only"
+  if [[ -s "${OUT_RAW}" ]] && [[ -f "${RAW_COMPLETE}" ]]; then
+    echo "[INFO] Verified raw .txt already exists -- skipping NetMHCpan, re-parsing only"
+  elif [[ -e "${OUT_RAW}" ]] || [[ -e "${RAW_COMPLETE}" ]]; then
+    echo "[ERROR] Refusing to use or overwrite an unverified raw prediction:" >&2
+    echo "[ERROR]   raw:    ${OUT_RAW}" >&2
+    echo "[ERROR]   marker: ${RAW_COMPLETE}" >&2
+    echo "[ERROR] A complete raw file must have its matching .txt.complete marker." >&2
+    exit 1
   else
 
     if [[ ${N_PEPS} -eq 0 ]]; then
       echo "[WARN] No peptides for ${LENPAD}mer -- skipping"; return
     fi
 
-    > "${OUT_RAW}"
+    # Write predictions to a job-specific partial file. Only atomically move it
+    # to OUT_RAW and create the completion marker after every chunk succeeds.
+    local OUT_RAW_PARTIAL="${OUT_RAW}.partial.${SLURM_JOB_ID:-$$}"
+    : > "${OUT_RAW_PARTIAL}"
 
     local CHUNK_PREFIX="${TMPDIR}/ip_chunk_${LENPAD}_"
     rm -f "${CHUNK_PREFIX}"*
@@ -136,49 +177,115 @@ run_netmhcpan_canonical() {
           -p "${CHUNK_FILE}" \
           -l "${LENGTH}" \
           -BA \
-          >> "${OUT_RAW}"
+          >> "${OUT_RAW_PARTIAL}"
       done
       rm -f "${CHUNK_FILE}"
     done
+
+    mv "${OUT_RAW_PARTIAL}" "${OUT_RAW}"
+    {
+      echo "status=complete"
+      echo "run_date=${EFFECTIVE_RUN_DATE}"
+      echo "alleles=${N_ALLELES}"
+      echo "peptides=${N_PEPS}"
+      echo "raw_bytes=$(stat -c%s "${OUT_RAW}")"
+    } > "${RAW_COMPLETE}"
     echo "[INFO] Raw output: ${OUT_RAW}"
+    echo "[INFO] Completion marker: ${RAW_COMPLETE}"
   fi
 
-  # Parse raw -> TSV
+  # Parse raw -> complete TSV in bounded chunks.
+  #
+  # Do not accumulate the full 70-allele output in memory: the raw output is
+  # >100 GB. Keep every valid prediction (SB, WB and NB), but flush parsed rows
+  # to disk every PARSE_CHUNK_SIZE records. Step 2b remains responsible for
+  # selecting the strong binders. Write atomically through a temporary file so
+  # an interrupted parse cannot be mistaken for a completed TSV on restart.
   python3 - <<PYEOF
+import os
+
 infile, outfile = "${OUT_RAW}", "${OUT_TSV}"
-rows = []
-with open(infile) as fh:
-    for line in fh:
+tmpfile = outfile + ".tmp"
+PARSE_CHUNK_SIZE = 100_000
+raw_lines = parsed_rows = chunks_written = 0
+row_chunk = []
+
+if os.path.exists(tmpfile):
+    os.remove(tmpfile)
+
+with open(infile, "r", errors="replace", buffering=1024 * 1024) as fh, \
+     open(tmpfile, "w", buffering=1024 * 1024) as out:
+    out.write("allele\tpeptide\tcore\t"
+              "netmhcpan_EL_score\tnetmhcpan_EL_rank\t"
+              "netmhcpan_BA_score\tnetmhcpan_BA_rank\tbinder\n")
+
+    for raw_lines, line in enumerate(fh, start=1):
+        if raw_lines % 10_000_000 == 0:
+            print(
+                f"[INFO] Parse progress: {raw_lines:,} raw lines; "
+                f"{parsed_rows:,} prediction rows written",
+                flush=True,
+            )
+
         line = line.rstrip()
         if not line or line[0] in ("#", "-") or \
            line.startswith(" Pos") or line.startswith("Protein") or \
            line.startswith("Error"):
             continue
+
         p = line.split()
-        if len(p) < 11:
+        if len(p) < 13:
             continue
+
+        allele, peptide, core = p[1], p[2], p[3]
+        if not allele.startswith("HLA-") or not peptide.isalpha():
+            continue
+
         try:
-            allele, peptide, core = p[1], p[2], p[3]
-            el_score, el_rank     = p[11], p[12]
+            el_score, el_rank = p[11], p[12]
             ba_score = p[13] if len(p) > 13 else "NA"
-            ba_rank  = p[14] if len(p) > 14 else "NA"
-            binder = ("SB" if len(p) >= 16 and p[-2] == "<=" and p[-1] == "SB"
-                      else "WB" if len(p) >= 16 and p[-2] == "<=" and p[-1] == "WB"
-                      else "NB")
-            if not allele.startswith("HLA") or not peptide.isalpha():
-                continue
-            rows.append([allele, peptide, core,
-                         el_score, el_rank, ba_score, ba_rank, binder])
+            ba_rank = p[14] if len(p) > 14 else "NA"
+            float(el_score)
+            float(el_rank)
+            if ba_score != "NA":
+                float(ba_score)
+            if ba_rank != "NA":
+                float(ba_rank)
         except (IndexError, ValueError):
             continue
 
-with open(outfile, "w") as out:
-    out.write("allele\tpeptide\tcore\t"
-              "netmhcpan_EL_score\tnetmhcpan_EL_rank\t"
-              "netmhcpan_BA_score\tnetmhcpan_BA_rank\tbinder\n")
-    for r in rows:
-        out.write("\t".join(r) + "\n")
-print(f"[INFO] Parsed {len(rows)} rows -> {outfile}")
+        # NetMHCpan appends "<= SB" or "<= WB" only to binder rows.
+        binder = (p[-1]
+                  if len(p) >= 2 and p[-2] == "<=" and p[-1] in ("SB", "WB")
+                  else "NB")
+
+        row_chunk.append("\t".join([
+            allele, peptide, core,
+            el_score, el_rank, ba_score, ba_rank, binder,
+        ]) + "\n")
+        parsed_rows += 1
+
+        if len(row_chunk) >= PARSE_CHUNK_SIZE:
+            out.writelines(row_chunk)
+            row_chunk.clear()
+            chunks_written += 1
+
+    if row_chunk:
+        out.writelines(row_chunk)
+        row_chunk.clear()
+        chunks_written += 1
+
+if parsed_rows == 0:
+    if os.path.exists(tmpfile):
+        os.remove(tmpfile)
+    raise RuntimeError("No NetMHCpan prediction rows were parsed")
+
+os.replace(tmpfile, outfile)
+print(
+    f"[INFO] Parsed and wrote {parsed_rows:,} prediction rows "
+    f"in {chunks_written:,} chunks -> {outfile}",
+    flush=True,
+)
 PYEOF
 
   echo "[INFO] ${LENPAD}mer TSV: ${OUT_TSV}"
