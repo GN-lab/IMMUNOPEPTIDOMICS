@@ -54,14 +54,21 @@ select_top_allele <- function(length_label) {
     return(invisible(NULL))
   }
 
-  dt <- fread(infile, na.strings = c("", "NA"))
-  cat(sprintf("[INFO] %smer: %d rows loaded\n", length_label, nrow(dt)))
+  # Stream-filter the complete Step 2a table before R reads it. With 70
+  # alleles the full TSV is tens of GB; fread()-then-filter duplicates that
+  # table during sorting and can exceed the Slurm memory limit. Step 2a keeps
+  # all SB/WB/NB rows, while only SB rows enter the in-memory selection here.
+  awk_program <- paste(
+    'BEGIN { FS="\\t" }',
+    'NR == 1 || $8 == "SB" || $8 == "<= SB"'
+  )
+  awk_command <- sprintf("awk %s %s", shQuote(awk_program), shQuote(infile))
+  sb <- fread(cmd = awk_command, na.strings = c("", "NA"))
+  cat(sprintf("[INFO] %smer: %d SB rows streamed from full Step 2a TSV\n",
+              length_label, nrow(sb)))
 
-  dt[, netmhcpan_EL_rank := as.numeric(netmhcpan_EL_rank)]
-
-  # Keep strong binders only
-  sb <- dt[binder %in% c("SB", "<= SB")]
-  cat(sprintf("[INFO] %smer: %d SB rows\n", length_label, nrow(sb)))
+  sb[, netmhcpan_EL_rank  := as.numeric(netmhcpan_EL_rank)]
+  sb[, netmhcpan_EL_score := as.numeric(netmhcpan_EL_score)]
 
   if (nrow(sb) == 0) {
     warning("[WARN] No strong binders for ", length_label, "mer")
