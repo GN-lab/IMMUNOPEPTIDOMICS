@@ -32,47 +32,144 @@ latest_file <- function(pattern) {
   files[which.max(file.info(files)$mtime)]
 }
 
-# Read both normal MHCflurry CSVs and the Step 3a CSV written with an
-# 8-column header above 11-column data rows. In the malformed legacy file,
-# affinity is field 7 and presentation score is field 10.
-read_mhcflurry <- function(path) {
-  probe <- readLines(path, n = 2L, warn = FALSE)
-  if (length(probe) < 2L) stop("[ERROR] Empty MHCflurry file: ", path)
+# Read the full Step 3a CSV in bounded chunks and retain only the current
+# best allele for each peptide. The 70-allele CSV is expected to approach a
+# billion rows, so loading it with one fread() call can exceed 64 GB. Memory
+# here scales with the number of unique peptides, not peptide x allele rows.
+read_mhcflurry_top_chunked <- function(path) {
+  chunk_rows <- suppressWarnings(as.integer(Sys.getenv(
+    "MHCFLURRY_CHUNK_ROWS", unset = "1000000"
+  )))
+  if (is.na(chunk_rows) || chunk_rows < 1000L) {
+    stop("[ERROR] MHCFLURRY_CHUNK_ROWS must be an integer >= 1000")
+  }
 
-  header_n <- lengths(strsplit(probe[1L], ",", fixed = TRUE))
-  data_n   <- lengths(strsplit(probe[2L], ",", fixed = TRUE))
+  con <- file(path, open = "r")
+  on.exit(close(con), add = TRUE)
 
-  if (header_n == 8L && data_n == 11L) {
+  header_line <- readLines(con, n = 1L, warn = FALSE)
+  first_data  <- readLines(con, n = 1L, warn = FALSE)
+  if (length(header_line) == 0L || length(first_data) == 0L) {
+    stop("[ERROR] Empty MHCflurry file: ", path)
+  }
+
+  header <- strsplit(header_line, ",", fixed = TRUE)[[1L]]
+  header <- trimws(gsub('^"|"$', "", header))
+  data_n <- length(strsplit(first_data, ",", fixed = TRUE)[[1L]])
+
+  if (length(header) == 8L && data_n == 11L) {
     cat("[WARN] Detected legacy 8-header/11-data CSV; parsing fields 1,2,7,10\n")
-    return(fread(
-      path, skip = 1L, header = FALSE,
-      select = c(1L, 2L, 7L, 10L),
-      col.names = c("peptide", "allele", "mhcflurry_affinity",
-                    "mhcflurry_presentation_score"),
-      na.strings = c("", "NA")
-    ))
+    selected <- c(1L, 2L, 7L, 10L)
+  } else {
+    affinity <- intersect(
+      c("mhcflurry_affinity", "mhcflurry_binding_affinity"), header
+    )[1L]
+    required <- c("peptide", "allele", "mhcflurry_presentation_score")
+    missing <- setdiff(required, header)
+    if (length(missing) || is.na(affinity)) {
+      stop("[ERROR] Unsupported MHCflurry columns in ", path,
+           "; header: ", paste(header, collapse = ","))
+    }
+    selected <- match(
+      c("peptide", "allele", affinity, "mhcflurry_presentation_score"),
+      header
+    )
   }
 
-  header <- names(fread(path, nrows = 0L))
-  affinity <- intersect(
-    c("mhcflurry_affinity", "mhcflurry_binding_affinity"), header
-  )[1L]
-  required <- c("peptide", "allele", "mhcflurry_presentation_score")
-  missing <- setdiff(required, header)
-  if (length(missing) || is.na(affinity)) {
-    stop("[ERROR] Unsupported MHCflurry columns in ", path,
-         "; header: ", paste(header, collapse = ","))
-  }
-
-  dt <- fread(
-    path, select = c("peptide", "allele", affinity,
-                     "mhcflurry_presentation_score"),
-    na.strings = c("", "NA")
+  output_names <- c(
+    "peptide", "allele", "mhcflurry_affinity",
+    "mhcflurry_presentation_score"
   )
-  if (affinity != "mhcflurry_affinity") {
-    setnames(dt, affinity, "mhcflurry_affinity")
+  pending <- first_data
+  best <- NULL
+  input_rows <- 0
+  chunk_number <- 0L
+
+  repeat {
+    need <- chunk_rows - length(pending)
+    new_lines <- if (need > 0L) {
+      readLines(con, n = need, warn = FALSE)
+    } else {
+      character()
+    }
+    n_new <- length(new_lines)
+    lines <- c(pending, new_lines)
+    pending <- character()
+    if (length(lines) == 0L) break
+
+    chunk_number <- chunk_number + 1L
+    input_rows <- input_rows + length(lines)
+    chunk_text <- paste(lines, collapse = "\n")
+    rm(lines, new_lines)
+
+    dt <- fread(
+      text = chunk_text, header = FALSE, select = selected,
+      col.names = output_names, na.strings = c("", "NA"),
+      showProgress = FALSE
+    )
+    rm(chunk_text)
+
+    dt[, mhcflurry_presentation_score :=
+         as.numeric(mhcflurry_presentation_score)]
+    dt[, mhcflurry_affinity := as.numeric(mhcflurry_affinity)]
+    dt <- dt[
+      !is.na(peptide) & peptide != "" & !is.na(allele) & allele != "" &
+      !is.na(mhcflurry_presentation_score)
+    ]
+
+    # Reduce duplicate peptides inside this chunk first.
+    setorder(dt, peptide, -mhcflurry_presentation_score)
+    chunk_top <- dt[, .SD[1L], by = peptide]
+    rm(dt)
+
+    if (is.null(best)) {
+      best <- chunk_top
+      setkey(best, peptide)
+    } else {
+      setkey(chunk_top, peptide)
+
+      # Update existing peptides only when the new score is strictly higher;
+      # ties retain the first allele, matching the previous stable ordering.
+      updates <- best[chunk_top, on = .(peptide), nomatch = 0L,
+        .(
+          peptide,
+          old_score = mhcflurry_presentation_score,
+          new_allele = i.allele,
+          new_affinity = i.mhcflurry_affinity,
+          new_score = i.mhcflurry_presentation_score
+        )
+      ]
+      updates <- updates[new_score > old_score]
+      if (nrow(updates) > 0L) {
+        best[updates, on = .(peptide), `:=`(
+          allele = i.new_allele,
+          mhcflurry_affinity = i.new_affinity,
+          mhcflurry_presentation_score = i.new_score
+        )]
+      }
+
+      new_peptides <- chunk_top[!best, on = .(peptide)]
+      if (nrow(new_peptides) > 0L) {
+        best <- rbindlist(list(best, new_peptides), use.names = TRUE)
+        setkey(best, peptide)
+      }
+      rm(chunk_top, updates, new_peptides)
+    }
+
+    cat(sprintf(
+      "[INFO] Chunk %d: %.0f input rows scanned; %d peptide maxima retained\n",
+      chunk_number, input_rows, nrow(best)
+    ))
+    gc(verbose = FALSE)
+
+    if (n_new < need) break
   }
-  dt
+
+  if (is.null(best) || nrow(best) == 0L) {
+    stop("[ERROR] No valid MHCflurry rows parsed from: ", path)
+  }
+  setorder(best, peptide)
+  best
 }
 
 ###########################################################################
@@ -94,18 +191,7 @@ for (len in c("08", "09", "10", "11")) {
   f <- files[which.max(file.info(files)$mtime)]
   cat(sprintf("[INFO] Loading: %s\n", basename(f)))
 
-  dt <- read_mhcflurry(f)
-  dt[, mhcflurry_presentation_score := as.numeric(mhcflurry_presentation_score)]
-  dt[, mhcflurry_affinity           := as.numeric(mhcflurry_affinity)]
-  if (all(is.na(dt$mhcflurry_presentation_score)) ||
-      all(is.na(dt$mhcflurry_affinity))) {
-    stop("[ERROR] Parsed MHCflurry score columns contain only NA: ", f)
-  }
-  cat(sprintf("[INFO] %d rows loaded\n", nrow(dt)))
-
-  # Best allele per peptide: highest presentation score
-  setorder(dt, peptide, -mhcflurry_presentation_score)
-  top <- dt[, .SD[1L], by = peptide]
+  top <- read_mhcflurry_top_chunked(f)
   cat(sprintf("[INFO] %d unique peptides after best-allele selection\n", nrow(top)))
 
   out_file <- file.path(directory_out,
@@ -113,7 +199,7 @@ for (len in c("08", "09", "10", "11")) {
   fwrite(top, out_file, sep = "\t", col.names = TRUE, quote = FALSE)
   cat(sprintf("[INFO] Written: %s\n", out_file))
 
-  rm(dt, top); gc()
+  rm(top); gc()
 }
 
 cat("\n[DONE] Step 3b complete.\n")
