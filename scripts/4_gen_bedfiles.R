@@ -18,11 +18,18 @@ NMP_WB_RANK <- 2.0
 MHC_AFF_NM <- 500
 run_date <- format(Sys.Date(), "%Y%m%d")
 lengths <- c("08", "09", "10", "11")
+chunk_rows <- suppressWarnings(as.integer(Sys.getenv(
+  "STEP4_CHUNK_ROWS", unset = "1000000"
+)))
+if (is.na(chunk_rows) || chunk_rows < 10000L) {
+  stop("[ERROR] STEP4_CHUNK_ROWS must be an integer >= 10000")
+}
 
 cat("[CONFIG] OUTPUT_DIR: ", output_dir, "\n", sep = "")
 cat("[CONFIG] Tier 1: NMP EL rank <0.5 AND MHCflurry affinity <500 nM\n")
 cat("[CONFIG] Tier 2: NMP EL rank >=0.5 and <2.0 AND MHCflurry affinity <500 nM\n")
 cat("[CONFIG] Tier 3: one tool binds and the other does not\n")
+cat(sprintf("[CONFIG] Chunk rows: %d\n", chunk_rows))
 
 newest <- function(pattern) {
   files <- list.files(output_dir, pattern = pattern, full.names = TRUE)
@@ -38,44 +45,173 @@ bed_allele <- function(x) {
   gsub("[*:]", "", normalize_allele(x))
 }
 
+# Stream a delimited file through bounded line chunks. The callback filters each
+# chunk before it is retained, so memory scales with biologically relevant rows
+# rather than with the approximately one-billion-row raw prediction matrices.
+read_filtered_chunks <- function(path, sep, selected, column_names,
+                                 label, filter_chunk) {
+  con <- file(path, open = "r")
+  on.exit(close(con), add = TRUE)
+
+  header_line <- readLines(con, n = 1L, warn = FALSE)
+  first_data <- readLines(con, n = 1L, warn = FALSE)
+  if (!length(header_line) || !length(first_data)) {
+    stop("[ERROR] Empty ", label, " file: ", path)
+  }
+
+  pending <- first_data
+  retained_parts <- list()
+  input_rows <- 0
+  retained_rows <- 0
+  chunk_number <- 0L
+
+  repeat {
+    need <- chunk_rows - length(pending)
+    new_lines <- if (need > 0L) {
+      readLines(con, n = need, warn = FALSE)
+    } else {
+      character()
+    }
+    n_new <- length(new_lines)
+    lines <- c(pending, new_lines)
+    pending <- character()
+    if (!length(lines)) break
+
+    chunk_number <- chunk_number + 1L
+    input_rows <- input_rows + length(lines)
+    chunk_text <- paste(lines, collapse = "\n")
+    rm(lines, new_lines)
+
+    dt <- fread(
+      text = chunk_text,
+      header = FALSE,
+      sep = sep,
+      select = selected,
+      col.names = column_names,
+      na.strings = c("", "NA"),
+      showProgress = FALSE
+    )
+    rm(chunk_text)
+
+    kept <- filter_chunk(dt)
+    rm(dt)
+    if (nrow(kept)) {
+      retained_parts[[length(retained_parts) + 1L]] <- kept
+      retained_rows <- retained_rows + nrow(kept)
+    }
+
+    if (chunk_number %% 10L == 0L || n_new < need) {
+      cat(sprintf(
+        "[INFO] %s chunk %d: %.0f rows scanned; %.0f candidate rows retained\n",
+        label, chunk_number, input_rows, retained_rows
+      ))
+    }
+    if (n_new < need) break
+  }
+
+  if (!length(retained_parts)) {
+    stop("[ERROR] No relevant rows retained from ", label, ": ", path)
+  }
+  rbindlist(retained_parts, use.names = TRUE)
+}
+
+read_netmhcpan_relevant <- function(path) {
+  header_line <- readLines(path, n = 1L, warn = FALSE)
+  header <- strsplit(header_line, "\t", fixed = TRUE)[[1L]]
+  required <- c(
+    "allele", "peptide", "netmhcpan_EL_score", "netmhcpan_EL_rank",
+    "netmhcpan_BA_score", "netmhcpan_BA_rank"
+  )
+  selected <- match(required, header)
+  if (anyNA(selected)) {
+    stop("[ERROR] Unsupported NetMHCpan header: ", paste(header, collapse = "\t"))
+  }
+
+  nmp <- read_filtered_chunks(
+    path = path,
+    sep = "\t",
+    selected = selected,
+    column_names = required,
+    label = "NetMHCpan",
+    filter_chunk = function(dt) {
+      dt[, allele := normalize_allele(allele)]
+      dt[, netmhcpan_EL_rank := as.numeric(netmhcpan_EL_rank)]
+      dt[, netmhcpan_EL_score := as.numeric(netmhcpan_EL_score)]
+      dt <- dt[!is.na(netmhcpan_EL_rank) & netmhcpan_EL_rank < NMP_WB_RANK]
+      if (nrow(dt)) {
+        setorder(dt, allele, peptide, netmhcpan_EL_rank,
+                 -netmhcpan_EL_score)
+        dt <- unique(dt, by = c("allele", "peptide"))
+      }
+      dt
+    }
+  )
+
+  # A peptide-allele pair can straddle a line-chunk boundary. Apply the same
+  # ordering and de-duplication once globally after raw rows are filtered.
+  setorder(nmp, allele, peptide, netmhcpan_EL_rank, -netmhcpan_EL_score)
+  unique(nmp, by = c("allele", "peptide"))
+}
+
 # Step 3a previously wrote an 8-field header above 11-field data rows.
 # In that legacy file affinity is field 7 and presentation score is field 10.
-read_mhcflurry <- function(path) {
+read_mhcflurry_binders <- function(path) {
   probe <- readLines(path, n = 2L, warn = FALSE)
   if (length(probe) < 2L) stop("[ERROR] Empty MHCflurry file: ", path)
-  header_n <- lengths(strsplit(probe[1L], ",", fixed = TRUE))
+  header <- strsplit(probe[1L], ",", fixed = TRUE)[[1L]]
+  header <- trimws(gsub('^"|"$', "", header))
   data_n <- lengths(strsplit(probe[2L], ",", fixed = TRUE))
 
-  if (header_n == 8L && data_n == 11L) {
+  if (length(header) == 8L && data_n == 11L) {
     cat("[WARN] Legacy 8-header/11-data MHCflurry CSV detected; using fields 1,2,7,10\n")
-    return(fread(
-      path, skip = 1L, header = FALSE,
-      select = c(1L, 2L, 7L, 10L),
-      col.names = c("peptide", "allele", "mhcflurry_affinity",
-                    "mhcflurry_presentation_score"),
-      na.strings = c("", "NA")
-    ))
+    selected <- c(1L, 2L, 7L, 10L)
+  } else {
+    affinity <- intersect(
+      c("mhcflurry_affinity", "mhcflurry_binding_affinity"), header
+    )[1L]
+    required <- c("peptide", "allele", "mhcflurry_presentation_score")
+    if (length(setdiff(required, header)) || is.na(affinity)) {
+      stop("[ERROR] Unsupported MHCflurry header: ", paste(header, collapse = ","))
+    }
+    selected <- match(
+      c("peptide", "allele", affinity, "mhcflurry_presentation_score"),
+      header
+    )
   }
 
-  header <- names(fread(path, nrows = 0L))
-  affinity <- intersect(
-    c("mhcflurry_affinity", "mhcflurry_binding_affinity"), header
-  )[1L]
-  required <- c("peptide", "allele", "mhcflurry_presentation_score")
-  if (length(setdiff(required, header)) || is.na(affinity)) {
-    stop("[ERROR] Unsupported MHCflurry header: ", paste(header, collapse = ","))
-  }
-
-  dt <- fread(
-    path,
-    select = c("peptide", "allele", affinity,
-               "mhcflurry_presentation_score"),
-    na.strings = c("", "NA")
+  output_names <- c(
+    "peptide", "allele", "mhcflurry_affinity",
+    "mhcflurry_presentation_score"
   )
-  if (affinity != "mhcflurry_affinity") {
-    setnames(dt, affinity, "mhcflurry_affinity")
+  mhc <- read_filtered_chunks(
+    path = path,
+    sep = ",",
+    selected = selected,
+    column_names = output_names,
+    label = "MHCflurry",
+    filter_chunk = function(dt) {
+      dt[, allele := normalize_allele(allele)]
+      dt[, mhcflurry_affinity := as.numeric(mhcflurry_affinity)]
+      dt[, mhcflurry_presentation_score :=
+           as.numeric(mhcflurry_presentation_score)]
+      dt <- dt[!is.na(mhcflurry_affinity) &
+               mhcflurry_affinity < MHC_AFF_NM]
+      if (nrow(dt)) {
+        setorder(dt, allele, peptide, mhcflurry_affinity,
+                 -mhcflurry_presentation_score)
+        dt <- unique(dt, by = c("allele", "peptide"))
+      }
+      dt
+    }
+  )
+
+  if (all(is.na(mhc$mhcflurry_affinity)) ||
+      all(is.na(mhc$mhcflurry_presentation_score))) {
+    stop("[ERROR] Parsed MHCflurry score columns contain only NA")
   }
-  dt
+  setorder(mhc, allele, peptide, mhcflurry_affinity,
+           -mhcflurry_presentation_score)
+  unique(mhc, by = c("allele", "peptide"))
 }
 
 is_low_complexity <- function(pep) {
@@ -97,41 +233,16 @@ for (idx in seq_along(lengths)) {
   }
 
   cat("[INFO] NetMHCpan: ", basename(nmp_file), "\n", sep = "")
-  nmp <- fread(
-    nmp_file,
-    select = c("allele", "peptide", "netmhcpan_EL_score",
-               "netmhcpan_EL_rank", "netmhcpan_BA_score",
-               "netmhcpan_BA_rank"),
-    na.strings = c("", "NA")
-  )
-  nmp[, allele := normalize_allele(allele)]
-  nmp[, netmhcpan_EL_rank := as.numeric(netmhcpan_EL_rank)]
-  nmp[, netmhcpan_EL_score := as.numeric(netmhcpan_EL_score)]
-  setorder(nmp, allele, peptide, netmhcpan_EL_rank, -netmhcpan_EL_score)
-  nmp <- unique(nmp, by = c("allele", "peptide"))
-
   # Only NMP SB/WB rows can enter a retained concordance tier by themselves.
   # NMP NB rows are recovered implicitly when a MHC binder has no NMP SB/WB row.
-  nmp_relevant <- nmp[!is.na(netmhcpan_EL_rank) & netmhcpan_EL_rank < NMP_WB_RANK]
+  nmp_relevant <- read_netmhcpan_relevant(nmp_file)
   cat(sprintf("[INFO] NMP relevant (EL rank <2): %d rows\n", nrow(nmp_relevant)))
-  rm(nmp); gc(verbose = FALSE)
+  gc(verbose = FALSE)
 
   cat("[INFO] MHCflurry: ", basename(mhc_file), "\n", sep = "")
-  mhc <- read_mhcflurry(mhc_file)
-  mhc[, allele := normalize_allele(allele)]
-  mhc[, mhcflurry_affinity := as.numeric(mhcflurry_affinity)]
-  mhc[, mhcflurry_presentation_score := as.numeric(mhcflurry_presentation_score)]
-  if (all(is.na(mhc$mhcflurry_affinity)) ||
-      all(is.na(mhc$mhcflurry_presentation_score))) {
-    stop("[ERROR] Parsed MHCflurry score columns contain only NA")
-  }
-  setorder(mhc, allele, peptide, mhcflurry_affinity,
-           -mhcflurry_presentation_score)
-  mhc <- unique(mhc, by = c("allele", "peptide"))
-  mhc_binder <- mhc[!is.na(mhcflurry_affinity) &
-                    mhcflurry_affinity < MHC_AFF_NM]
+  mhc_binder <- read_mhcflurry_binders(mhc_file)
   cat(sprintf("[INFO] MHC binders (<500 nM): %d rows\n", nrow(mhc_binder)))
-  rm(mhc); gc(verbose = FALSE)
+  gc(verbose = FALSE)
 
   # Full join of all potentially retained calls. Missing tool values mean NB.
   cross <- merge(
