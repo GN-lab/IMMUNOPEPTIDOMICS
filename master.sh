@@ -294,7 +294,7 @@ touch \"${WORKDIR}/.checkpoints/step3a_mhcflurry.done\""
       --cpus-per-task=4 \
       --mem-per-cpu=13600 \
       --gpus-per-node=1 \
-      --time=7-00:00:00 \
+      --time=12-00:00:00 \
       --output="logs/step3a_mhcflurry_%j.log" \
       ${jobStep1:+--dependency=afterok:${jobStep1}} \
       "$SCRIPT_3A")
@@ -327,7 +327,7 @@ touch \"${WORKDIR}/.checkpoints/step3b_select_mhcflurry.done\""
       --partition=compute \
       --cpus-per-task=8 \
       --mem-per-cpu=8042 \
-      --time=2:00:00 \
+      --time=5-00:00:00 \
       --output="logs/step3b_select_mhcflurry_%j.log" \
       ${jobStep3a:+--dependency=afterok:${jobStep3a}} \
       "$SCRIPT_3B")
@@ -368,7 +368,7 @@ touch \"${WORKDIR}/.checkpoints/step4_gen_bedfiles.done\""
       --partition=compute \
       --cpus-per-task=8 \
       --mem-per-cpu=8042 \
-      --time=2:00:00 \
+      --time=5-00:00:00 \
       --output="logs/step4_gen_bedfiles_%j.log" \
       ${step4Deps:+--dependency=afterok:${step4Deps}} \
       "$SCRIPT_4")
